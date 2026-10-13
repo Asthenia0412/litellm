@@ -48,8 +48,10 @@ from litellm.proxy._experimental.mcp_server.ui_session_utils import (
 )
 from litellm.proxy._experimental.mcp_server.utils import (
     MCPMissingUserEnvVarsError,
+    add_server_prefix_to_name,
     get_server_prefix,
     merge_mcp_headers,
+    strip_known_server_prefix,
 )
 from litellm.proxy._types import (
     LitellmUserRoles,
@@ -1227,6 +1229,7 @@ if MCP_AVAILABLE:
         from fastapi import HTTPException
 
         from litellm.exceptions import BlockedPiiEntityError, GuardrailRaisedException
+        from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import MCPRequestHandler
         from litellm.proxy.common_request_processing import (
             ProxyBaseLLMRequestProcessing,
         )
@@ -1330,6 +1333,18 @@ if MCP_AVAILABLE:
                     if target_server is not None and target_server.auth_type in _CLIENT_FORWARDED_TOKEN_AUTH_TYPES
                     else None
                 )
+                guardrail_auth: Final = (
+                    await MCPRequestHandler.billing_auth_for_tool_call(
+                        user_api_key_dict,
+                        tool_name=(
+                            tool_name
+                            if strip_known_server_prefix(tool_name, target_server) != tool_name
+                            else add_server_prefix_to_name(tool_name, get_server_prefix(target_server))
+                        ),
+                    )
+                    if target_server is not None
+                    else user_api_key_dict
+                )
 
                 # Call execute_mcp_tool directly (permission checks already done)
                 _tool_start_time: Final = datetime.now()
@@ -1350,6 +1365,7 @@ if MCP_AVAILABLE:
                     incoming_bearer_token=MCPRequestHandler.get_guardrail_bearer_token(
                         request.headers, user_api_key_dict
                     ),
+                    guardrail_auth=guardrail_auth,
                 )
                 result: Final = complete_call_tool_result(executed, WireCompat.LEGACY)
             except Exception as e:

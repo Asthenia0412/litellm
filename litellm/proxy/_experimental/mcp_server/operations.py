@@ -1986,6 +1986,7 @@ async def execute_mcp_tool(
     raw_headers: dict[str, str] | None = None,
     host_progress_callback: ProgressCallback | None = None,
     guardrail_context: Mapping[str, object] | None = None,
+    guardrail_auth: UserAPIKeyAuth | None = None,
     client_ip: str | None = None,
     wire_compat: WireCompat = WireCompat.LEGACY,
     input_responses: InputResponses | None = None,
@@ -2010,6 +2011,7 @@ async def execute_mcp_tool(
         start_time=start_time,
         host_progress_callback=host_progress_callback,
         guardrail_context=guardrail_context,
+        guardrail_auth=guardrail_auth,
         logging_data=types.MappingProxyType(kwargs),
         input_responses=input_responses,
         request_state=request_state,
@@ -2029,6 +2031,7 @@ async def _execute_mcp_tool(
     raw_headers: dict[str, str] | None = None,
     host_progress_callback: ProgressCallback | None = None,
     guardrail_context: Mapping[str, object] | None = None,
+    guardrail_auth: UserAPIKeyAuth | None = None,
     client_ip: str | None = None,
     wire_compat: WireCompat = WireCompat.LEGACY,
     input_responses: InputResponses | None = None,
@@ -2058,6 +2061,7 @@ async def _execute_mcp_tool(
     """
     # Track resolved MCP server for both permission checks and dispatch
     mcp_server: MCPServer | None = None
+    effective_guardrail_auth: Final = guardrail_auth if guardrail_auth is not None else user_api_key_auth
     requested_server_id: Final[str | None] = kwargs.get("requested_server_id")
 
     # If the client called with a display-name override (e.g. "Get Pet"),
@@ -2272,6 +2276,7 @@ async def _execute_mcp_tool(
                 ),
             ),
             incoming_bearer_token=incoming_bearer_token,
+            guardrail_auth=effective_guardrail_auth,
         )
         # `pre_call_tool_check` may return guardrail-modified
         # arguments; honor them on the local path too.
@@ -2320,6 +2325,7 @@ async def _execute_mcp_tool(
             name=original_tool_name,
             arguments=arguments,
             user_api_key_auth=user_api_key_auth,
+            guardrail_auth=effective_guardrail_auth,
             mcp_auth_header=mcp_auth_header,
             catalog_auth_header=client_auth_header,
             mcp_server_auth_headers=mcp_server_auth_headers,
@@ -2329,7 +2335,11 @@ async def _execute_mcp_tool(
             litellm_logging_obj=litellm_logging_obj,
             guardrail_context=guardrail_context,
             host_progress_callback=_guarded_progress_callback(
-                host_progress_callback, litellm_logging_obj, user_api_key_auth, kwargs
+                callback=host_progress_callback,
+                logging_obj=litellm_logging_obj,
+                original_auth=user_api_key_auth,
+                guardrail_auth=effective_guardrail_auth,
+                request_data=kwargs,
             ),
             wire_compat=wire_compat,
             input_responses=input_responses,
@@ -2408,6 +2418,7 @@ async def _execute_mcp_tool(
                     ),
                 ),
                 incoming_bearer_token=incoming_bearer_token,
+                guardrail_auth=effective_guardrail_auth,
             )
             if "arguments" in hook_result:
                 arguments = hook_result["arguments"]  # pyright: ignore[reportAny]  # hook returns untyped args
@@ -2420,7 +2431,8 @@ async def _execute_mcp_tool(
     return await _run_post_mcp_call_guardrails(
         result=converted,
         litellm_logging_obj=litellm_logging_obj,
-        user_api_key_auth=user_api_key_auth,
+        original_auth=user_api_key_auth,
+        guardrail_auth=effective_guardrail_auth,
         request_data=kwargs,
     )
 
@@ -2428,7 +2440,8 @@ async def _execute_mcp_tool(
 def _guarded_progress_callback(
     callback: ProgressCallback | None,
     logging_obj: LiteLLMLoggingObj | None,
-    caller: UserAPIKeyAuth | None,
+    original_auth: UserAPIKeyAuth | None,
+    guardrail_auth: UserAPIKeyAuth | None,
     request_data: Mapping[str, object],
 ) -> ProgressCallback | None:
     if callback is None:
@@ -2440,7 +2453,11 @@ def _guarded_progress_callback(
             return
         try:
             checked: Final = await _run_post_mcp_call_guardrails(
-                CallToolResult(content=[TextContent(type="text", text=message)]), logging_obj, caller, request_data
+                CallToolResult(content=[TextContent(type="text", text=message)]),
+                litellm_logging_obj=logging_obj,
+                original_auth=original_auth,
+                guardrail_auth=guardrail_auth,
+                request_data=request_data,
             )
             filtered: Final = TextContent.model_validate(checked.content[0]).text
         except Exception:  # noqa: BLE001  # any guardrail failure must withhold unverified progress text
@@ -2455,7 +2472,8 @@ def _guarded_progress_callback(
 async def _run_post_mcp_call_guardrails(
     result: CallToolResult,
     litellm_logging_obj: LiteLLMLoggingObj | None,
-    user_api_key_auth: UserAPIKeyAuth | None,
+    original_auth: UserAPIKeyAuth | None,
+    guardrail_auth: UserAPIKeyAuth | None,
     request_data: Mapping[str, object],
 ) -> CallToolResult:
     """Run ``post_mcp_call`` guardrails over an executed tool result.
@@ -2470,12 +2488,41 @@ async def _run_post_mcp_call_guardrails(
 
     if proxy_logging_obj is None:
         return result
+    post_auth: Final = guardrail_auth if guardrail_auth is not None else original_auth
+    if post_auth is original_auth:
+        request_data_for_hook: Final = (
+            litellm_logging_obj.model_call_details if litellm_logging_obj is not None else dict(request_data)
+        )
+        return await proxy_logging_obj.post_mcp_call_hook(
+            response=result,
+            request_data=request_data_for_hook,
+            user_api_key_dict=post_auth,
+        )
+    from litellm.proxy.litellm_pre_call_utils import add_guardrails_from_auth_metadata
+
+    base_request_data: Final[Mapping[str, object]] = (
+        litellm_logging_obj.model_call_details if litellm_logging_obj is not None else request_data
+    )
+    request_metadata: Final[object | None] = base_request_data.get("metadata")
+    metadata: Final[Mapping[str, object]] = (
+        TypeAdapter(Mapping[str, object]).validate_python(request_metadata)
+        if isinstance(request_metadata, Mapping)
+        else {}
+    )
+    guardrail_request_data: Final[dict[str, object]] = {  # mutable-ok: the guardrail resolver mutates request metadata
+        **base_request_data,
+        "metadata": dict(metadata),
+    }
+    if post_auth is not None:
+        add_guardrails_from_auth_metadata(
+            user_api_key_dict=post_auth,
+            data=guardrail_request_data,
+            metadata_variable_name="metadata",
+        )
     return await proxy_logging_obj.post_mcp_call_hook(
         response=result,
-        request_data=(
-            litellm_logging_obj.model_call_details if litellm_logging_obj is not None else dict(request_data)
-        ),
-        user_api_key_dict=user_api_key_auth,
+        request_data=guardrail_request_data,
+        user_api_key_dict=post_auth,
     )
 
 
@@ -2621,6 +2668,7 @@ async def call_mcp_tool(
     input_responses: InputResponses | None = None,
     request_state: str | None = None,
     incoming_bearer_token: SecretStr | None | EllipsisType = ...,
+    guardrail_auth: UserAPIKeyAuth | None = None,
     **kwargs: Any,
 ) -> CallToolResult | InputRequiredResult:
     """
@@ -2684,6 +2732,7 @@ async def call_mcp_tool(
             request_state=request_state,
             incoming_bearer_token=incoming_bearer_token,
             requested_server_id=scoped_server.server_id if scoped_server is not None else None,
+            guardrail_auth=guardrail_auth,
             **kwargs,
         )
     except Exception as e:
@@ -2872,6 +2921,7 @@ async def _handle_managed_mcp_tool(
     litellm_logging_obj: LiteLLMLoggingObj | None = None,
     host_progress_callback: ProgressCallback | None = None,
     guardrail_context: Mapping[str, object] | None = None,
+    guardrail_auth: UserAPIKeyAuth | None = None,
     client_ip: str | None = None,
     wire_compat: WireCompat = WireCompat.LEGACY,
     input_responses: InputResponses | None = None,
@@ -2901,6 +2951,7 @@ async def _handle_managed_mcp_tool(
         host_progress_callback=host_progress_callback,
         litellm_logging_obj=litellm_logging_obj,
         guardrail_context=guardrail_context,
+        guardrail_auth=guardrail_auth,
         wire_compat=wire_compat,
         input_responses=input_responses,
         request_state=request_state,
@@ -3097,7 +3148,12 @@ async def _execute_mcp_server_tool_call(
             raw_headers=raw_headers,
             client_ip=_client_ip,
         )
-        if user_api_key_auth is not None:
+        guardrail_auth: Final = (
+            await MCPRequestHandler.billing_auth_for_tool_call(user_api_key_auth, tool_name=params.name)
+            if user_api_key_auth is not None
+            else None
+        )
+        if guardrail_auth is not None:
             data = await add_litellm_data_to_request(
                 data=body_data,
                 request=request,
@@ -3109,9 +3165,7 @@ async def _execute_mcp_server_tool_call(
                 # half (an already-over-budget team stops granting) lives in the source gate.
                 # Authorization is unaffected: it ran before this, and the union is resolved
                 # from the untouched auth object passed to call_mcp_tool below.
-                user_api_key_dict=await MCPRequestHandler.billing_auth_for_tool_call(
-                    user_api_key_auth, tool_name=params.name
-                ),
+                user_api_key_dict=guardrail_auth,
                 proxy_config=proxy_config,
             )
         else:
@@ -3130,6 +3184,7 @@ async def _execute_mcp_server_tool_call(
             input_responses=params.input_responses,
             request_state=params.request_state,
             incoming_bearer_token=context.incoming_bearer_token,
+            guardrail_auth=guardrail_auth,
             **data,  # for logging
         )
     except MCPMissingUserEnvVarsError as e:
@@ -3591,6 +3646,7 @@ class GatewayOperations:
                     client_ip=_client_ip,
                     host_progress_callback=operation.host_progress_callback,
                     guardrail_context=operation.guardrail_context,
+                    guardrail_auth=operation.guardrail_auth,
                     wire_compat=context.wire_compat,
                     input_responses=operation.input_responses,
                     request_state=operation.request_state,
