@@ -10067,6 +10067,123 @@ async def test_handle_list_tools_attaches_outcome_meta(_mcp_request_ctx):
     assert outcomes_meta["broken"] == {"status": "unreachable"}
 
 
+async def _list_tools_with_listing(_mcp_request_ctx, listing, params):
+    try:
+        from litellm.proxy._experimental.mcp_server.server import handle_list_tools
+    except ImportError:
+        pytest.skip("MCP server not available")
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.server.get_or_extract_auth_context",
+            new=AsyncMock(return_value=(None, None, None, None, None, None, None)),
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations._list_mcp_tools",
+            new=AsyncMock(return_value=listing),
+        ),
+    ):
+        return await handle_list_tools(_mcp_request_ctx(), params)
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_errors_when_every_server_failed(_mcp_request_ctx):
+    """An all-failed first page must not read as a healthy empty catalog: the aggregate answers
+    a -32603 carrying the same per-server outcomes it would have put in _meta."""
+    from mcp.shared.exceptions import MCPError
+    from mcp.types import INTERNAL_ERROR
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
+        SERVER_OUTCOMES_META_KEY,
+        AggregateToolListing,
+        ServerListFault,
+    )
+
+    listing = AggregateToolListing(
+        tools=[],
+        outcomes={
+            "a": ServerListFault(tag="upstream_error", status_code=429),
+            "b": ServerListFault(tag="timeout"),
+        },
+    )
+
+    with pytest.raises(MCPError) as exc_info:
+        await _list_tools_with_listing(_mcp_request_ctx, listing, _paged_params())
+
+    assert exc_info.value.error.code == INTERNAL_ERROR
+    assert exc_info.value.error.data[SERVER_OUTCOMES_META_KEY] == {
+        "a": {"status": "upstream_error", "http_status": 429},
+        "b": {"status": "timeout"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_auth_fault_keeps_degraded_result(_mcp_request_ctx):
+    """An auth outcome means the caller can fix the listing by authenticating, so it stays a 200
+    with outcomes rather than an error."""
+    from mcp.types import ListToolsResult
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
+        SERVER_OUTCOMES_META_KEY,
+        AggregateToolListing,
+        ServerListFault,
+    )
+
+    listing = AggregateToolListing(
+        tools=[],
+        outcomes={"a": ServerListFault(tag="auth_required", status_code=401), "b": ServerListFault(tag="timeout")},
+    )
+
+    result = await _list_tools_with_listing(_mcp_request_ctx, listing, _paged_params())
+
+    assert isinstance(result, ListToolsResult)
+    assert result.tools == []
+    wire = result.model_dump(by_alias=True)
+    assert wire["_meta"][SERVER_OUTCOMES_META_KEY]["a"] == {"status": "auth_required", "http_status": 401}
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_all_faults_on_continuation_stays_degraded(_mcp_request_ctx):
+    """A continuation request keeps the current behavior: no -32603 even when every server in the
+    page faulted, since the cursor pins an earlier healthy snapshot."""
+    from mcp.types import ListToolsResult, PaginatedRequestParams
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
+        SERVER_OUTCOMES_META_KEY,
+        AggregateToolListing,
+        ServerListFault,
+    )
+
+    listing = AggregateToolListing(
+        tools=[],
+        outcomes={"a": ServerListFault(tag="upstream_error", status_code=429)},
+    )
+
+    result = await _list_tools_with_listing(_mcp_request_ctx, listing, PaginatedRequestParams(cursor="cursor-1"))
+
+    assert isinstance(result, ListToolsResult)
+    assert result.tools == []
+    wire = result.model_dump(by_alias=True)
+    assert wire["_meta"][SERVER_OUTCOMES_META_KEY]["a"] == {"status": "upstream_error", "http_status": 429}
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_empty_outcomes_is_a_clean_empty_result(_mcp_request_ctx):
+    """No servers in scope means no outcomes and no error: an empty catalog is only a failure when
+    servers were supposed to answer and all of them faulted."""
+    from mcp.types import ListToolsResult
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import AggregateToolListing
+
+    listing = AggregateToolListing(tools=[], outcomes={})
+
+    result = await _list_tools_with_listing(_mcp_request_ctx, listing, _paged_params())
+
+    assert isinstance(result, ListToolsResult)
+    assert result.tools == []
+    assert result.model_dump(by_alias=True).get("_meta") is None
+
+
 def _make_oauth2_server(
     alias: str,
     *,
