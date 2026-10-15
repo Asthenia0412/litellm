@@ -105,6 +105,9 @@ def _reconstruct_ui_where_from_sql(sql_query, params):
             "lte": _iso(params[end_index - 1]),
         }
     remaining = clause.group(1) if search_clause is None else clause.group(1).replace(search_clause.group(0), "")
+    agent_row_predicate_present: Final = "COALESCE(agent_id, '') <> ''" in remaining
+    if agent_row_predicate_present:
+        where["span_type"] = "llm" if "AND NOT (call_type = 'asend_message'" in remaining else "agent"
 
     eq_cols = {
         "team_id": "team_id",
@@ -143,7 +146,7 @@ def _reconstruct_ui_where_from_sql(sql_query, params):
             where["cache_hit"] = "hit"
         elif cond == "(cache_hit IS NULL OR LOWER(cache_hit) != 'true')":
             where["cache_hit"] = "miss"
-        elif "call_type" in cond:
+        elif "call_type" in cond and not agent_row_predicate_present:
             if "call_type NOT IN" in cond:
                 where["span_type"] = "llm"
             elif "call_mcp_tool" in cond:
@@ -3334,29 +3337,50 @@ async def test_ui_view_spend_logs_with_span_type_filter(client, monkeypatch):
     mock_spend_logs = [
         {**base, "id": "log1", "request_id": "req-llm", "call_type": "acompletion"},
         {**base, "id": "log2", "request_id": "req-agent", "call_type": "asend_message"},
-        {**base, "id": "log3", "request_id": "req-mcp", "call_type": "call_mcp_tool"},
-        {**base, "id": "log4", "request_id": "req-batch", "call_type": "aretrieve_batch"},
+        {
+            **base,
+            "id": "log3",
+            "request_id": "req-agent-key",
+            "call_type": "acompletion",
+            "agent_id": "agent-1",
+        },
+        {**base, "id": "log4", "request_id": "req-mcp", "call_type": "call_mcp_tool", "agent_id": "agent-2"},
+        {**base, "id": "log5", "request_id": "req-batch", "call_type": "aretrieve_batch", "agent_id": "agent-3"},
     ]
 
-    call_types_by_span = {
-        "llm": lambda ct: (
-            ct not in {"call_mcp_tool", "list_mcp_tools", "asend_message"}
-            and ct not in {"acreate_batch", "create_batch", "aretrieve_batch", "retrieve_batch"}
-        ),
-        "agent": lambda ct: ct == "asend_message",
-        "mcp": lambda ct: ct in {"call_mcp_tool", "list_mcp_tools"},
-        "batch": lambda ct: ct in {"acreate_batch", "create_batch", "aretrieve_batch", "retrieve_batch"},
-    }
-
-    def filter_by_span_type(where):
-        span_type = where.get("span_type")
+    def filter_by_span_type(where: dict[str, object]) -> list[dict[str, object]]:
+        span_type: Final = where.get("span_type")
         if span_type is None:
             return mock_spend_logs
-        return [log for log in mock_spend_logs if call_types_by_span[span_type](log["call_type"])]
+        if not isinstance(span_type, str):
+            return []
+
+        def matches_span(log: dict[str, object]) -> bool:
+            call_type: Final = log.get("call_type")
+            is_mcp: Final = call_type in {"call_mcp_tool", "list_mcp_tools"}
+            is_batch: Final = call_type in {"acreate_batch", "create_batch", "aretrieve_batch", "retrieve_batch"}
+            is_agent: Final = call_type == "asend_message" or (
+                bool(log.get("agent_id")) and not is_mcp and not is_batch
+            )
+            match span_type:
+                case "llm":
+                    return not is_mcp and not is_batch and not is_agent
+                case "agent":
+                    return is_agent
+                case "mcp":
+                    return is_mcp
+                case "batch":
+                    return is_batch
+                case _:
+                    return False
+
+        return [log for log in mock_spend_logs if matches_span(log)]
+
+    query_observer: Final = MagicMock()
 
     monkeypatch.setattr(
         "litellm.proxy.proxy_server.prisma_client",
-        make_ui_spend_logs_mock_prisma(mock_spend_logs, filter_by_span_type),
+        make_ui_spend_logs_mock_prisma(mock_spend_logs, filter_by_span_type, query_observer=query_observer),
     )
 
     start_date, end_date = _default_date_range()
@@ -3367,8 +3391,9 @@ async def test_ui_view_spend_logs_with_span_type_filter(client, monkeypatch):
             ("batch", ["req-batch"]),
             ("llm", ["req-llm"]),
             ("mcp", ["req-mcp"]),
-            ("agent", ["req-agent"]),
+            ("agent", ["req-agent", "req-agent-key"]),
         ]:
+            query_observer.reset_mock()
             response = client.get(
                 "/spend/logs/ui",
                 params={
@@ -3382,6 +3407,19 @@ async def test_ui_view_spend_logs_with_span_type_filter(client, monkeypatch):
             data = response.json()
             assert data["total"] == len(expected_ids)
             assert [row["request_id"] for row in data["data"]] == expected_ids
+            if span_type in {"agent", "llm"}:
+                agent_row_sql: Final = (
+                    "(call_type = 'asend_message' OR (COALESCE(agent_id, '') <> '' "
+                    "AND call_type NOT IN ('call_mcp_tool', 'list_mcp_tools') "
+                    "AND call_type NOT IN ('acreate_batch', 'create_batch', 'aretrieve_batch', 'retrieve_batch')))"
+                )
+                observed_sql: Final = tuple(call.args[0] for call in query_observer.call_args_list)
+                assert observed_sql
+                assert all(agent_row_sql in sql for sql in observed_sql)
+                if span_type == "llm":
+                    assert all(f"AND NOT {agent_row_sql}" in sql for sql in observed_sql)
+                else:
+                    assert all(f"AND {agent_row_sql}" in sql for sql in observed_sql)
 
         response = client.get(
             "/spend/logs/ui",
@@ -3392,7 +3430,7 @@ async def test_ui_view_spend_logs_with_span_type_filter(client, monkeypatch):
             headers={"Authorization": "Bearer sk-test"},
         )
         assert response.status_code == 200
-        assert response.json()["total"] == 4
+        assert response.json()["total"] == 5
 
         response = client.get(
             "/spend/logs/ui",
@@ -4908,6 +4946,14 @@ async def test_build_ui_spend_logs_response_dict_rows_session_counts():
 
     # The count is folded into the single aggregate query; no separate group_by call.
     mock_prisma.db.litellm_spendlogs.group_by.assert_not_called()
+    aggregate_sql: Final = mock_prisma.db.query_raw.await_args.args[0]
+    agent_row_sql: Final = (
+        "(call_type = 'asend_message' OR (COALESCE(agent_id, '') <> '' "
+        "AND call_type NOT IN ('call_mcp_tool', 'list_mcp_tools') "
+        "AND call_type NOT IN ('acreate_batch', 'create_batch', 'aretrieve_batch', 'retrieve_batch')))"
+    )
+    assert f"WHERE call_type NOT IN ('call_mcp_tool', 'list_mcp_tools') AND NOT {agent_row_sql}" in aggregate_sql
+    assert f"COUNT(*) FILTER (WHERE {agent_row_sql})::int AS session_agent_count" in aggregate_sql
 
 
 @pytest.mark.asyncio
