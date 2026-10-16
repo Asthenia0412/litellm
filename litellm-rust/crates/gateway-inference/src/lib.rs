@@ -27,7 +27,7 @@ use litellm_llms::base_llm::ocr::{handler::OcrClient, settings::OcrSettings};
 use litellm_secrets::source::SecretSource;
 
 pub use error::Error;
-pub use litellm_router::{Deployment, Router as ModelRouter};
+pub use litellm_router::{Deployment, Error as RoutingError, Router as ModelRouter};
 pub use request::{JsonObject, RequestId};
 
 pub struct Gateway {

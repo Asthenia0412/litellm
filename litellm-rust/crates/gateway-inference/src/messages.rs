@@ -46,8 +46,8 @@ async fn handle(
     headers: &HeaderMap,
     body: Map<String, Value>,
 ) -> Result<Response, Error> {
-    let deployment = request::resolve_deployment(gateway, &body)?;
-    request::authorize_model(identity, deployment, &body).await?;
+    let group = request::resolve_group(gateway, &body)?;
+    let name = request::model_name(&body)?.to_owned();
     let (body, cache_options) = crate::caching::prepare(identity, body)?;
     let route = gateway.messages.clone();
     let route = match &gateway.cache {
@@ -58,13 +58,37 @@ async fn handle(
         None => route,
     };
 
-    let call = project(deployment, body, headers)?;
-    let machine = route.machine(call, cache_options.policy);
-    let stream =
-        Sse::<Messages, _, _>::new(Json, |error| Bytes::from(Error::from(error).sse_frame()));
-    let headers = crate::caching::CacheHeaders::default();
-    let response = litellm_host_http::serve(machine, (), headers.clone(), stream, None).await?;
-    Ok(headers.apply(response))
+    let cache_headers = crate::caching::CacheHeaders::default();
+    let mut body = Some(body);
+    let routed = gateway
+        .models
+        .route(
+            group,
+            |attempt| {
+                // Only the last attempt may move the body; earlier ones keep it for a retry.
+                let body = if attempt.last {
+                    body.take()
+                } else {
+                    body.clone()
+                };
+                let route = route.clone();
+                let cache_headers = cache_headers.clone();
+                let name = name.as_str();
+                async move {
+                    crate::observe::record(name, attempt.deployment);
+                    request::authorize(identity, name, attempt.deployment).await?;
+                    let call = project(attempt.deployment, body.unwrap_or_default(), headers)?;
+                    let machine = route.machine(call, cache_options.policy);
+                    let stream = Sse::<Messages, _, _>::new(Json, |error| {
+                        Bytes::from(Error::from(error).sse_frame())
+                    });
+                    Ok(litellm_host_http::serve(machine, (), cache_headers, stream, None).await?)
+                }
+            },
+            Error::failure,
+        )
+        .await?;
+    Ok(cache_headers.apply(request::hold(routed)))
 }
 
 fn project(

@@ -1,9 +1,11 @@
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes, HttpBody},
     extract::{FromRequest, FromRequestParts, Multipart, OriginalUri, Request},
     http::request::Parts,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
+use litellm_router::{ModelGroup, Routed};
 use serde_json::{Map, Value};
 
 use crate::{Deployment, Error, Gateway};
@@ -95,10 +97,15 @@ pub(crate) async fn authorize_model(
     deployment: &Deployment,
     body: &Map<String, Value>,
 ) -> Result<(), Error> {
-    let name = body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::InvalidBody("model is required".into()))?;
+    authorize(identity, model_name(body)?, deployment).await
+}
+
+/// Checks that the caller may use the public model `name` served by `deployment`.
+pub(crate) async fn authorize(
+    identity: &litellm_gateway_auth::AuthenticatedRequest,
+    name: &str,
+    deployment: &Deployment,
+) -> Result<(), Error> {
     let access = litellm_gateway_auth::AccessRequest::Model {
         name: name.into(),
         deployment: deployment.model.clone(),
@@ -110,20 +117,48 @@ pub(crate) async fn authorize_model(
     Ok(())
 }
 
+pub(crate) fn model_name(body: &Map<String, Value>) -> Result<&str, Error> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidBody("model is required".into()))
+}
+
+/// The model group a request names.
+pub(crate) fn resolve_group<'a>(
+    gateway: &'a Gateway,
+    body: &Map<String, Value>,
+) -> Result<&'a ModelGroup, Error> {
+    let model = model_name(body)?;
+    gateway
+        .models
+        .group(model)
+        .ok_or_else(|| Error::UnknownModel(model.to_owned()))
+}
+
+/// One deployment of the group a request names, for endpoints served without retries.
 pub(crate) fn resolve_deployment<'a>(
     gateway: &'a Gateway,
     body: &Map<String, Value>,
 ) -> Result<&'a Deployment, Error> {
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::InvalidBody("model is required".into()))?;
-    let deployment = gateway
-        .models
-        .get(model)
-        .ok_or_else(|| Error::UnknownModel(model.to_owned()))?;
+    let model = model_name(body)?;
+    let deployment = gateway.models.select(resolve_group(gateway, body)?);
     crate::observe::record(model, deployment);
     Ok(deployment)
+}
+
+/// A routed response that keeps its deployment marked in flight until its body is done.
+/// A body of known length is already complete, so its mark is released at once.
+pub(crate) fn hold(routed: Routed<Response>) -> Response {
+    let Routed { value, in_flight } = routed;
+    if value.body().size_hint().exact().is_some() {
+        return value;
+    }
+    value.map(|body| {
+        Body::from_stream(body.into_data_stream().map(move |chunk| {
+            let _held = &in_flight;
+            chunk
+        }))
+    })
 }
 
 async fn parse_multipart(mut multipart: Multipart) -> Result<InferenceBody, Error> {
