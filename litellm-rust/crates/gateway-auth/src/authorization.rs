@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::{AuthFuture, AuthenticatedCaller, Clock, Error, SharedCaller};
+use crate::{
+    AuthFuture, AuthenticatedCaller, Clock, Error, SharedCaller,
+    keys::{AllowedRoutes, KeyModels},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum McpAction {
@@ -34,14 +37,50 @@ pub enum Permissions {
     #[default]
     None,
     Only(Arc<[AccessRequest]>),
+    /// A virtual key: no MCP or UI access.
+    VirtualKey(KeyGrant),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KeyGrant {
+    pub models: KeyModels,
+    pub routes: AllowedRoutes,
 }
 
 impl Permissions {
     pub fn allows(&self, request: &AccessRequest) -> bool {
-        match self {
-            Self::All => true,
-            Self::None => false,
-            Self::Only(allowed) => allowed.contains(request),
+        match (self, request) {
+            (Self::All, _) => true,
+            (Self::None, _) => false,
+            (Self::Only(allowed), _) => allowed.contains(request),
+            (Self::VirtualKey(grant), AccessRequest::Route { path, .. }) => {
+                grant.routes.allows(path)
+            }
+            (Self::VirtualKey(grant), AccessRequest::Model { name, .. }) => {
+                grant.models.check(name).is_ok()
+            }
+            (Self::VirtualKey(_), AccessRequest::Mcp { .. } | AccessRequest::Ui(_)) => false,
+        }
+    }
+
+    fn denial(&self, request: &AccessRequest) -> Error {
+        match (self, request) {
+            (Self::VirtualKey(grant), AccessRequest::Route { path, .. }) => {
+                Error::RouteNotAllowed {
+                    allowed: grant.routes.python_repr(),
+                    route: path.clone(),
+                }
+            }
+            (Self::VirtualKey(grant), AccessRequest::Model { name, .. }) => {
+                match grant.models.check(name) {
+                    Err(by) => Error::ModelAccessDenied {
+                        model: name.clone(),
+                        by,
+                    },
+                    Ok(()) => Error::Forbidden,
+                }
+            }
+            _ => Error::Forbidden,
         }
     }
 }
@@ -99,9 +138,11 @@ impl AuthenticatedRequest {
         {
             return Err(Error::Expired);
         }
-        if !self.caller.restrictions().allows(&request)
-            || !self.caller.permissions().allows(&request)
-        {
+        let restrictions = self.caller.restrictions();
+        if !restrictions.allows(&request) {
+            return Err(restrictions.denial(&request));
+        }
+        if !self.caller.permissions().allows(&request) {
             return Err(Error::Forbidden);
         }
         self.authorizer.authorize(&self.caller, &request).await?;
