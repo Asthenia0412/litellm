@@ -398,12 +398,15 @@ class LlmPassthroughRouteHandler(BaseTranslation):
         )
 
     @staticmethod
-    def supports_event_stream_de_anonymization(provider: str | None, endpoint: str | None) -> bool:
-        handler_cls: Final = _get_provider_handlers().get(provider or "")
-        endpoint_check: Final = getattr(handler_cls, "event_stream_endpoint_is_de_anonymizable", None)
-        if endpoint_check is None:
-            return False
-        return endpoint_check(endpoint or "")
+    def supports_event_stream_de_anonymization(provider: object, endpoint: object, model: object, body: object) -> bool:
+        """Whether the provider's guardrail translation can scan this endpoint's whole event stream for ``model`` and
+        the request ``body`` and rewrite its frames."""
+        endpoint_check: Final[Callable[[str, str, object], bool] | None] = getattr(
+            _provider_handler(provider), "event_stream_endpoint_is_de_anonymizable", None
+        )
+        return endpoint_check is not None and endpoint_check(
+            endpoint if isinstance(endpoint, str) else "", model if isinstance(model, str) else "", body
+        )
 
     @staticmethod
     async def de_anonymize_event_stream(
